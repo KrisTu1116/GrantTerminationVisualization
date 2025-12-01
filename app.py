@@ -418,7 +418,7 @@ def main():
         )
         tooltip_text = f"<b>{{name}}</b><br>{color_metric}: " + ("${financial_impact}" if 'Financial' in color_metric else "{"+target_col+"}")
 
-    st.pydeck_chart(pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view_state, layers=[layer], tooltip={"html": tooltip_text}))
+    st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=[layer], tooltip={"html": tooltip_text}))
     st.dataframe(df_agg[['municipality', 'financial_impact', 'poc_rate', 'poverty_rate']].sort_values('financial_impact', ascending=False), use_container_width=True)
 
 if __name__ == "__main__":
