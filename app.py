@@ -185,11 +185,39 @@ def load_and_process_data(start_date, end_date):
     combined['city_clean_raw'] = combined['recipient_city_name'].astype(str).str.upper().str.strip()
     combined['city_clean'] = combined['city_clean_raw'].replace(CITY_NAME_MANUAL_MAP)
     
+    # --- TOOLTIP AGGREGATION LOGIC ---
+    # Identify rows that are Cancelled or Rescinded and have impact > 0
+    impact_rows = combined[combined['impact_amount'] > 0].copy()
+    
+    # Format a detail string for each grant: "• [Cancelled] AwardID: $Amount"
+    # Truncate Award ID if too long? No, usually fine.
+    impact_rows['detail_str'] = (
+        "• [" + impact_rows['Category'] + "] " + 
+        impact_rows['Award ID'] + ": $" + 
+        impact_rows['impact_amount'].apply(lambda x: f"{x:,.0f}")
+    )
+    
+    # Group by city and concatenate. Limit to top 10 by amount to prevent massive tooltips.
+    # Sort by impact_amount desc within city first
+    impact_rows = impact_rows.sort_values(['city_clean', 'impact_amount'], ascending=[True, False])
+    
+    def aggregate_details(series):
+        items = series.tolist()
+        if len(items) > 8:
+            return "<br>".join(items[:8]) + f"<br>... and {len(items)-8} more"
+        return "<br>".join(items)
+        
+    details_agg = impact_rows.groupby('city_clean')['detail_str'].apply(aggregate_details).reset_index(name='grant_details')
+    
     city_agg = combined.groupby('city_clean').agg(
         financial_impact=('impact_amount', 'sum'),
         total_obligated=('total_obligated_amount', 'sum'),
         total_grants=('Award ID', 'count')
     ).reset_index()
+    
+    # Merge details
+    city_agg = city_agg.merge(details_agg, on='city_clean', how='left')
+    city_agg['grant_details'] = city_agg['grant_details'].fillna("No Impacted Grants")
     
     city_agg['termination_rate'] = np.where(city_agg['total_obligated'] > 0, city_agg['financial_impact'] / city_agg['total_obligated'], 0.0).clip(0, 1)
 
@@ -222,6 +250,24 @@ def aggregate_data(df, granularity):
     if granularity == 'Municipality Level': return df
     elif granularity == 'County Level':
         df_county = df[df['county'] != 'UNKNOWN'].copy()
+        
+        # For County Level tooltip, we can't list all grants. 
+        # Instead, let's list the "Top 5 Cities by Financial Impact".
+        # We need to calculate this before collapsing.
+        
+        def get_top_cities_summary(sub_df):
+            # Sort by financial_impact desc
+            top_cities = sub_df.sort_values('financial_impact', ascending=False).head(5)
+            summary = []
+            for _, row in top_cities.iterrows():
+                if row['financial_impact'] > 0:
+                    summary.append(f"• {row['municipality']}: ${row['financial_impact']/1e6:.1f}M")
+            if not summary: return "No Significant Impact"
+            return "<br>".join(summary)
+
+        # Apply custom aggregation for the tooltip
+        tooltip_series = df_county.groupby('county').apply(get_top_cities_summary)
+        
         grouped = df_county.groupby('county').apply(
             lambda x: pd.Series({
                 'financial_impact': x['financial_impact'].sum(),
@@ -232,6 +278,10 @@ def aggregate_data(df, granularity):
             })
         ).reset_index()
         grouped['municipality'] = grouped['county']
+        
+        # Merge the tooltip summary back
+        tooltip_df = tooltip_series.reset_index(name='grant_details')
+        grouped = grouped.merge(tooltip_df, on='county', how='left')
         
         grouped['poc_rate'] = grouped['poc_rate'].fillna(0)
         grouped['poverty_rate'] = grouped['poverty_rate'].fillna(0)
@@ -266,7 +316,7 @@ def main():
         st.warning("No impact data found for this period.")
         st.stop()
 
-    granularity = st.sidebar.radio("View Mode", ["County Level", "Municipality Level"])
+    granularity = st.sidebar.radio("View Mode", ["Municipality Level", "County Level"], index=0)
     
     # --- NEW MAP MODE: 3D INTERSECTIONALITY ---
     map_style = st.sidebar.radio(
@@ -283,6 +333,10 @@ def main():
         "POC Rate": "poc_rate", 
         "Poverty Rate": "poverty_rate"
     }
+
+    # Sort Control
+    sort_col_name = st.sidebar.selectbox("Sort Table By", list(metric_key_map.keys()), index=0)
+    sort_col = metric_key_map[sort_col_name]
 
     if "Real Boundaries" in map_style:
         # Single Metric for Choropleth
@@ -379,11 +433,13 @@ def main():
             raw_term = props.get('termination_rate', 0)
             raw_poc = props.get('poc_rate', 0)
             raw_pov = props.get('poverty_rate', 0)
+            raw_details = props.get('grant_details', 'No Details')
             
             feature['properties']['fmt_financial'] = f"${raw_fin:,.0f}"
             feature['properties']['fmt_termination'] = f"{raw_term:.1%}"
             feature['properties']['fmt_poc'] = f"{raw_poc:.1%}"
             feature['properties']['fmt_poverty'] = f"{raw_pov:.1%}"
+            feature['properties']['fmt_details'] = raw_details
             
             # 1. IMPACT (Size / Elevation)
             val_impact = props.get(target_col, 0)
@@ -463,6 +519,7 @@ def main():
             feature['properties']['fmt_termination'] = "0.0%"
             feature['properties']['fmt_poc'] = "0.0%"
             feature['properties']['fmt_poverty'] = "0.0%"
+            feature['properties']['fmt_details'] = "No Data"
             
             features_to_render.append(feature)
 
@@ -483,7 +540,7 @@ def main():
             get_fill_color="properties.dual_color",
             pickable=True
         )
-        tooltip_text = f"<b>{{name}}</b><br>Height ({impact_metric_name}): {{fmt_financial}} / {{fmt_termination}}<br>Color ({demo_metric_name}): {{fmt_poc}} / {{fmt_poverty}}"
+        tooltip_text = f"<b>{{name}}</b><br>Height ({impact_metric_name}): {{fmt_financial}} / {{fmt_termination}}<br>Color ({demo_metric_name}): {{fmt_poc}} / {{fmt_poverty}}<br><br><b>Details:</b><br>{{fmt_details}}"
         
     elif "Bubble" in map_style:
         view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=0)
@@ -497,7 +554,7 @@ def main():
             radius_scale=1, radius_min_pixels=3, radius_max_pixels=100,
             get_line_color=[50, 50, 50], line_width_min_pixels=1
         )
-        tooltip_text = f"<b>{{name}}</b><br>Size ({impact_metric_name}): {{fmt_financial}} / {{fmt_termination}}<br>Color ({demo_metric_name}): {{fmt_poc}} / {{fmt_poverty}}"
+        tooltip_text = f"<b>{{name}}</b><br>Size ({impact_metric_name}): {{fmt_financial}} / {{fmt_termination}}<br>Color ({demo_metric_name}): {{fmt_poc}} / {{fmt_poverty}}<br><br><b>Details:</b><br>{{fmt_details}}"
     else:
         view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=0)
         layer = pdk.Layer(
@@ -516,10 +573,10 @@ def main():
         }
         fmt_val = fmt_lookup.get(color_metric, "{"+target_col+"}")
         
-        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: {fmt_val}"
+        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: {fmt_val}<br><br><b>Details:</b><br>{{fmt_details}}"
 
     st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=[layer], tooltip={"html": tooltip_text}))
-    st.dataframe(df_agg[['municipality', 'financial_impact', 'termination_rate', 'poc_rate', 'poverty_rate']].sort_values('financial_impact', ascending=False), use_container_width=True)
+    st.dataframe(df_agg[['municipality', 'financial_impact', 'termination_rate', 'poc_rate', 'poverty_rate']].sort_values(sort_col, ascending=False), use_container_width=True)
 
 if __name__ == "__main__":
     main()
