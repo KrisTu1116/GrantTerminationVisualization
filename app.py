@@ -271,15 +271,43 @@ def main():
     # --- NEW MAP MODE: 3D INTERSECTIONALITY ---
     map_style = st.sidebar.radio(
         "Map Style", 
-        ["Real Boundaries (Choropleth)", "Bubble Map (Dots)", "3D Impact x Demographics"]
+        ["Real Boundaries (Choropleth)", "Bubble Map (Dual Layer)", "3D Impact x Demographics"]
     )
     
     exclude_boston = st.sidebar.checkbox("Exclude Boston (Outlier)", value=False)
     
-    # Metric selection only needed for 2D maps
-    color_metric = "Financial Impact ($)" # Default
-    if "3D" not in map_style:
-        color_metric = st.sidebar.selectbox("Map Color Metric", ["Financial Impact ($)", "Termination Rate (%)", "POC Rate", "Poverty Rate"], index=0)
+    # Dynamic Metric Selection
+    metric_key_map = {
+        "Financial Impact ($)": "financial_impact", 
+        "Termination Rate (%)": "termination_rate", 
+        "POC Rate": "poc_rate", 
+        "Poverty Rate": "poverty_rate"
+    }
+
+    if "Real Boundaries" in map_style:
+        # Single Metric for Choropleth
+        color_metric = st.sidebar.selectbox(
+            "Map Color Metric", 
+            list(metric_key_map.keys()), 
+            index=0
+        )
+        impact_metric_name = color_metric # For consistency in variable names
+        demo_metric_name = None
+    else:
+        # Dual Metric for Bubble/3D
+        st.sidebar.subheader("📊 Dual-Layer Settings")
+        demo_metric_name = st.sidebar.selectbox(
+            "Base Layer (Color)", 
+            ["POC Rate", "Poverty Rate"], 
+            index=0,
+            help="Determines the color intensity (Blue to Red)."
+        )
+        impact_metric_name = st.sidebar.selectbox(
+            "Impact Layer (Size/Height)", 
+            ["Financial Impact ($)", "Termination Rate (%)"], 
+            index=0,
+            help="Determines the radius of bubbles or height of 3D bars."
+        )
     
     df_agg = aggregate_data(df_raw, granularity)
     
@@ -290,7 +318,7 @@ def main():
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Financial Impact", f"${df_agg['financial_impact'].sum()/1e6:.1f}M", delta="Visible Loss")
     m2.metric("Avg Termination Rate", f"{df_agg['termination_rate'].mean()*100:.1f}%")
-    m3.metric("Most Impacted", df_agg.loc[df_agg['financial_impact'].idxmax()]['municipality'])
+    m3.metric("Most Impacted", df_agg.loc[df_agg['financial_impact'].idxmax()]['municipality'] if not df_agg.empty else "N/A")
 
     if granularity == 'County Level':
         geo_data = MA_COUNTIES_GEOJSON
@@ -301,8 +329,14 @@ def main():
         key_prop = 'TOWN'
 
     data_lookup = df_agg.set_index('municipality').to_dict('index')
-    metric_key_map = {"Financial Impact ($)": "financial_impact", "Termination Rate (%)": "termination_rate", "POC Rate": "poc_rate", "Poverty Rate": "poverty_rate"}
-    target_col = metric_key_map[color_metric]
+    
+    # Resolve Column Names
+    if "Real Boundaries" in map_style:
+        target_col = metric_key_map[color_metric]
+        demo_col = None
+    else:
+        target_col = metric_key_map[impact_metric_name]
+        demo_col = metric_key_map[demo_metric_name]
     
     def get_centroid(geometry):
         if geometry['type'] == 'Polygon':
@@ -315,10 +349,19 @@ def main():
 
     # --- PREPARE DATA FOR RENDERING ---
     # Pre-calculate max values for normalization
-    impact_values = df_agg['financial_impact'].fillna(0).values
-    log_impact = np.log1p(impact_values)
-    max_log_impact = log_impact.max() if log_impact.max() > 0 else 1
-    
+    # Impact Normalization (Log for $, Linear for %)
+    if 'Financial' in impact_metric_name:
+        impact_values = df_agg[target_col].fillna(0).values
+        log_impact = np.log1p(impact_values)
+        max_val_impact = log_impact.max() if log_impact.max() > 0 else 1
+        is_log = True
+    else:
+        # Rate is already 0-1, but let's normalize to max in dataset for visibility or keep absolute?
+        # Keeping absolute 0-1 is better for rates, but for size we might want relative scaling.
+        # Let's use relative to max to make dots visible even if rates are low overall.
+        max_val_impact = df_agg[target_col].max() if df_agg[target_col].max() > 0 else 1
+        is_log = False
+
     features_to_render = []
     
     for feature in geo_data['features']:
@@ -329,72 +372,101 @@ def main():
             feature['properties'].update(props)
             feature['properties']['name'] = g_name
             
-            # Calculate Metrics
-            impact = props.get('financial_impact', 0)
-            poc = props.get('poc_rate', 0)
+            # --- Calculate Render Properties ---
             
-            # --- 3D Logic ---
-            # Elevation = Financial Impact (Log Scale)
-            feature['properties']['elevation'] = (np.log1p(impact) / max_log_impact) * 50000 # Max height 50km
-            
-            # Color = POC Rate (Blue -> Red Gradient)
-            # Simple Red Scale based on POC % (0.0 - 1.0)
-            # Low POC = Blue [50, 50, 255], High POC = Red [255, 50, 50]
-            r = int(255 * poc)
-            b = int(255 * (1 - poc))
-            feature['properties']['poc_rgb'] = [r, 0, b, 200]
-            
-            # --- 2D Logic ---
-            val = props.get(target_col, 0)
-            norm_val = 0
-            if 'Impact' in color_metric:
-                norm_val = np.log1p(val) / max_log_impact if max_log_impact > 0 else 0
+            # 1. IMPACT (Size / Elevation)
+            val_impact = props.get(target_col, 0)
+            if is_log:
+                norm_impact = np.log1p(val_impact) / max_val_impact
             else:
-                max_lin = df_agg[target_col].max()
-                norm_val = val / max_lin if max_lin > 0 else 0
-            if np.isnan(norm_val) or norm_val < 0: norm_val = 0
+                norm_impact = val_impact / max_val_impact
             
-            if 'Impact' in color_metric or 'Rate' in color_metric:
-                c = int(255 * (1 - norm_val))
-                feature['properties']['fill_rgb'] = [255, c, c, 200]
-                feature['properties']['dot_rgb'] = [255, 50, 50, 200]
-            else:
-                c = int(255 * (1 - norm_val))
-                feature['properties']['fill_rgb'] = [c, c, 255, 200]
-                feature['properties']['dot_rgb'] = [50, 50, 255, 200]
+            if np.isnan(norm_impact) or norm_impact < 0: norm_impact = 0
             
-            feature['properties']['radius'] = 300 + (norm_val * 12000)
+            # 2. DEMOGRAPHICS (Color) - Only for Dual Modes
+            if demo_col:
+                val_demo = props.get(demo_col, 0)
+                # Demographics are 0.0 - 1.0. 
+                # We map 0.0 -> Blue, 1.0 -> Red.
+                # We can just use the raw rate as 't'.
+                t = val_demo 
+                r = int(255 * t)
+                b = int(255 * (1 - t))
+                feature['properties']['dual_color'] = [r, 0, b, 200]
+            
+            # --- Assign to Feature ---
+            
+            # Elevation (3D)
+            feature['properties']['elevation'] = norm_impact * 50000 
+            
+            # Radius (Bubble) - Scale based on impact
+            feature['properties']['radius'] = 300 + (norm_impact * 12000)
+            
+            # Centroid
             feature['properties']['centroid'] = get_centroid(feature['geometry'])
             
+            # Color Logic
+            if "Real Boundaries" in map_style:
+                # Single Metric Logic
+                val = props.get(target_col, 0)
+                # Normalize generic
+                if 'Financial' in color_metric:
+                     norm_single = np.log1p(val) / (np.log1p(df_agg[target_col].max()) if df_agg[target_col].max() > 0 else 1)
+                else:
+                     norm_single = val / (df_agg[target_col].max() if df_agg[target_col].max() > 0 else 1)
+                
+                if np.isnan(norm_single): norm_single = 0
+                
+                # Red scale for Impact/Rate, Blue for Demo (inverted?) - Let's keep simple Heatmap style
+                # Actually, user wanted consistent: Impact = Red, Demo = Blue.
+                if 'Impact' in color_metric or 'Rate' in color_metric: # Termination Rate
+                    c = int(255 * (1 - norm_single))
+                    feature['properties']['fill_rgb'] = [255, c, c, 200] # Red Gradient
+                else: # POC / Poverty
+                    # High POC = Dark Blue? Or High POC = Red (Risk)?
+                    # Usually High POC = Focus. Let's match 3D: High = Red? 
+                    # Previous code: High POC = Blue [50,50,255]?? No, let's look at previous code.
+                    # Previous: High val -> c is small. [c, c, 255]. So High val = [0,0,255] (Blue).
+                    # Let's switch to Heatmap style (Red) for all "Heat" maps? 
+                    # Or keep Blue for demographics to distinguish.
+                    c = int(255 * (1 - norm_single))
+                    feature['properties']['fill_rgb'] = [c, c, 255, 200] # Blue Gradient
+            else:
+                # Dual Mode Colors
+                feature['properties']['fill_rgb'] = feature['properties']['dual_color']
+                feature['properties']['dot_rgb'] = feature['properties']['dual_color']
+                # For 3D, fill_color is used. For Bubble, dot_rgb is used.
+
             features_to_render.append(feature)
         else:
+            # Missing Data
             feature['properties']['fill_rgb'] = [240, 240, 240, 100]
-            feature['properties']['poc_rgb'] = [200, 200, 200, 100]
+            feature['properties']['dual_color'] = [200, 200, 200, 100]
+            feature['properties']['dot_rgb'] = [200, 200, 200, 100]
             feature['properties']['elevation'] = 100
-            feature['properties']['name'] = g_name
             feature['properties']['radius'] = 100
             feature['properties']['centroid'] = get_centroid(feature['geometry'])
-            feature['properties']['dot_rgb'] = [200, 200, 200, 100]
+            feature['properties']['name'] = g_name
             features_to_render.append(feature)
 
     geo_data['features'] = features_to_render
 
     # --- RENDER ---
     if "3D" in map_style:
-        view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=60, bearing=30) # Tilted View
+        view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=60, bearing=30)
         layer = pdk.Layer(
             "GeoJsonLayer",
             geo_data,
             opacity=0.9,
             stroked=False,
             filled=True,
-            extruded=True, # Enable Height
+            extruded=True,
             wireframe=True,
             get_elevation="properties.elevation",
-            get_fill_color="properties.poc_rgb",
+            get_fill_color="properties.dual_color",
             pickable=True
         )
-        tooltip_text = "<b>{name}</b><br>Financial Loss: ${financial_impact}<br>POC: {poc_rate}"
+        tooltip_text = f"<b>{{name}}</b><br>Height ({impact_metric_name}): {{financial_impact:.0f}} / {{termination_rate:.1%}}<br>Color ({demo_metric_name}): {{poc_rate:.1%}} / {{poverty_rate:.1%}}"
         
     elif "Bubble" in map_style:
         view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=0)
@@ -406,8 +478,9 @@ def main():
             get_fill_color="properties.dot_rgb",
             pickable=True, opacity=0.8, stroked=True, filled=True,
             radius_scale=1, radius_min_pixels=3, radius_max_pixels=100,
+            get_line_color=[50, 50, 50], line_width_min_pixels=1
         )
-        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: " + ("${financial_impact}" if 'Financial' in color_metric else "{"+target_col+"}")
+        tooltip_text = f"<b>{{name}}</b><br>Size ({impact_metric_name}): {{financial_impact:.0f}} / {{termination_rate:.1%}}<br>Color ({demo_metric_name}): {{poc_rate:.1%}} / {{poverty_rate:.1%}}"
     else:
         view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=0)
         layer = pdk.Layer(
@@ -416,10 +489,10 @@ def main():
             opacity=0.8, stroked=True, filled=True, extruded=False, wireframe=True,
             get_fill_color="properties.fill_rgb", get_line_color=[100, 100, 100], line_width_min_pixels=1, pickable=True
         )
-        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: " + ("${financial_impact}" if 'Financial' in color_metric else "{"+target_col+"}")
+        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: " + ("${financial_impact}" if 'Financial' in color_metric else ("{termination_rate:.1%}" if 'Term' in color_metric else "{"+target_col+":.1%}"))
 
     st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=[layer], tooltip={"html": tooltip_text}))
-    st.dataframe(df_agg[['municipality', 'financial_impact', 'poc_rate', 'poverty_rate']].sort_values('financial_impact', ascending=False), use_container_width=True)
+    st.dataframe(df_agg[['municipality', 'financial_impact', 'termination_rate', 'poc_rate', 'poverty_rate']].sort_values('financial_impact', ascending=False), use_container_width=True)
 
 if __name__ == "__main__":
     main()
