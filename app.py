@@ -374,6 +374,17 @@ def main():
             
             # --- Calculate Render Properties ---
             
+            # Pre-format strings for tooltip (PyDeck doesn't support f-string formatting in JS)
+            raw_fin = props.get('financial_impact', 0)
+            raw_term = props.get('termination_rate', 0)
+            raw_poc = props.get('poc_rate', 0)
+            raw_pov = props.get('poverty_rate', 0)
+            
+            feature['properties']['fmt_financial'] = f"${raw_fin:,.0f}"
+            feature['properties']['fmt_termination'] = f"{raw_term:.1%}"
+            feature['properties']['fmt_poc'] = f"{raw_poc:.1%}"
+            feature['properties']['fmt_poverty'] = f"{raw_pov:.1%}"
+            
             # 1. IMPACT (Size / Elevation)
             val_impact = props.get(target_col, 0)
             if is_log:
@@ -447,6 +458,12 @@ def main():
             feature['properties']['radius'] = 100
             feature['properties']['centroid'] = get_centroid(feature['geometry'])
             feature['properties']['name'] = g_name
+            
+            feature['properties']['fmt_financial'] = "$0"
+            feature['properties']['fmt_termination'] = "0.0%"
+            feature['properties']['fmt_poc'] = "0.0%"
+            feature['properties']['fmt_poverty'] = "0.0%"
+            
             features_to_render.append(feature)
 
     geo_data['features'] = features_to_render
@@ -466,7 +483,7 @@ def main():
             get_fill_color="properties.dual_color",
             pickable=True
         )
-        tooltip_text = f"<b>{{name}}</b><br>Height ({impact_metric_name}): {{financial_impact:.0f}} / {{termination_rate:.1%}}<br>Color ({demo_metric_name}): {{poc_rate:.1%}} / {{poverty_rate:.1%}}"
+        tooltip_text = f"<b>{{name}}</b><br>Height ({impact_metric_name}): {{fmt_financial}} / {{fmt_termination}}<br>Color ({demo_metric_name}): {{fmt_poc}} / {{fmt_poverty}}"
         
     elif "Bubble" in map_style:
         view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=0)
@@ -480,7 +497,7 @@ def main():
             radius_scale=1, radius_min_pixels=3, radius_max_pixels=100,
             get_line_color=[50, 50, 50], line_width_min_pixels=1
         )
-        tooltip_text = f"<b>{{name}}</b><br>Size ({impact_metric_name}): {{financial_impact:.0f}} / {{termination_rate:.1%}}<br>Color ({demo_metric_name}): {{poc_rate:.1%}} / {{poverty_rate:.1%}}"
+        tooltip_text = f"<b>{{name}}</b><br>Size ({impact_metric_name}): {{fmt_financial}} / {{fmt_termination}}<br>Color ({demo_metric_name}): {{fmt_poc}} / {{fmt_poverty}}"
     else:
         view_state = pdk.ViewState(latitude=42.1, longitude=-71.5, zoom=8, pitch=0)
         layer = pdk.Layer(
@@ -489,7 +506,17 @@ def main():
             opacity=0.8, stroked=True, filled=True, extruded=False, wireframe=True,
             get_fill_color="properties.fill_rgb", get_line_color=[100, 100, 100], line_width_min_pixels=1, pickable=True
         )
-        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: " + ("${financial_impact}" if 'Financial' in color_metric else ("{termination_rate:.1%}" if 'Term' in color_metric else "{"+target_col+":.1%}"))
+        
+        # Helper to select correct pre-formatted field based on user selection
+        fmt_lookup = {
+            "Financial Impact ($)": "{fmt_financial}",
+            "Termination Rate (%)": "{fmt_termination}",
+            "POC Rate": "{fmt_poc}",
+            "Poverty Rate": "{fmt_poverty}"
+        }
+        fmt_val = fmt_lookup.get(color_metric, "{"+target_col+"}")
+        
+        tooltip_text = f"<b>{{name}}</b><br>{color_metric}: {fmt_val}"
 
     st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=[layer], tooltip={"html": tooltip_text}))
     st.dataframe(df_agg[['municipality', 'financial_impact', 'termination_rate', 'poc_rate', 'poverty_rate']].sort_values('financial_impact', ascending=False), use_container_width=True)
